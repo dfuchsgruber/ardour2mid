@@ -171,6 +171,29 @@ def track_add_messages(track: mido.MidiTrack, messages: List[mido.Message], auto
         
     verbose_print(f'Added {len(all_messages)} messages to track.', verbose=verbose)
 
+def sanitize_messages(messages: Dict[str, List[mido.Message]]) -> Dict[str, List[mido.Message]]:
+    """ Sanitizes the messages in a playlist. """
+    sanitized = {}
+    for route_id, msgs in messages.items():
+        sanitized[route_id] = []
+        note_is_on = [False for _ in range(128)]
+        for msg in msgs:
+            if msg.type == 'note_on':
+                if note_is_on[msg.note]:
+                    warnings.warn(f'Overlapping notes in route {route_id} at tick {msg.time}. Turning off previous note.')
+                    sanitized[route_id].append(mido.Message('note_off', note=msg.note, time=msg.time))
+                    msg = msg.copy()
+                    msg.time = 0
+                note_is_on[msg.note] = True
+            elif msg.type == 'note_off':
+                if not note_is_on[msg.note]:
+                    warnings.warn(f'Found note off event without note on event in route {route_id} at {msg.time}. Skipping...')
+                    continue
+                note_is_on[msg.note] = False
+            sanitized[route_id].append(msg)
+        if any(note_is_on):
+            warnings.warn(f'Notes are still on at the end of route {route_id}. Is this wanted?')
+    return sanitized
 
 def assemble(ardour_dom : xml.dom.minidom.Document, output_midi : mido.MidiFile, midi_sources : Dict[str, str],
                 messages : Dict[str, List[mido.Message]], ticks_per_beat=19200, verbose : bool = False):
@@ -199,51 +222,53 @@ def assemble(ardour_dom : xml.dom.minidom.Document, output_midi : mido.MidiFile,
             previous_region_end_time = 0
             for region_idx, region in enumerate(playlist.getElementsByTagName('Region')):
                 verbose_print(f'\tRegion {region_idx}:', verbose=verbose)
-                source_midi_path = midi_sources[region.getAttribute('source-0')]
-                source_midi = mido.MidiFile(source_midi_path)
-                start_beats, length_beats, beat = (float(region.getAttribute(attr)) for attr in ('start-beats', 'length-beats', 'beat'))
+                source_midi_path = midi_sources.get(region.getAttribute('source-0'), None)
+                # print(source_midi_path)
+                if source_midi_path:
+                    source_midi = mido.MidiFile(source_midi_path)
+                    start_beats, length_beats, beat = (float(region.getAttribute(attr)) for attr in ('start-beats', 'length-beats', 'beat'))
 
-                # Keep track of which note is on and off. We want to set notes to "off" if they are playing after a region has ended
-                note_is_on = [False for _ in range(128)]
+                    # Keep track of which note is on and off. We want to set notes to "off" if they are playing after a region has ended
+                    note_is_on = [False for _ in range(128)]
 
-                total_time += beat * ticks_per_beat - previous_region_end_time
-                source_midi_total_time = 0
-                num_events_inserted = 0
+                    total_time += beat * ticks_per_beat - previous_region_end_time
+                    source_midi_total_time = 0
+                    num_events_inserted = 0
 
-                for msg in source_midi.tracks[0]:
-                    if not msg.is_meta:
-                        source_midi_total_time += msg.time
-                        time_first_msg = int((total_time - previous_region_end_time) + (source_midi_total_time - start_beats * ticks_per_beat))
-                        if source_midi_total_time >= start_beats * ticks_per_beat and source_midi_total_time <= (length_beats + start_beats) * ticks_per_beat:
-                            if msg.type == 'note_on':
-                                note_is_on[msg.note] = True
-                            elif msg.type == 'note_off':
-                                note_is_on[msg.note] = False
-                            if time_first_msg < 0:
-                                raise RuntimeWarning(f'Region {region_idx} in playlist {playlist_idx} overlapps with previous region.')
-                            elif num_events_inserted == 0:
-                                msg_to_insert = msg.copy(time = time_first_msg)
-                                total_time = time_first_msg + previous_region_end_time
+                    for msg in source_midi.tracks[0]:
+                        if not msg.is_meta:
+                            source_midi_total_time += msg.time
+                            time_first_msg = int((total_time - previous_region_end_time) + (source_midi_total_time - start_beats * ticks_per_beat))
+                            if source_midi_total_time >= start_beats * ticks_per_beat and source_midi_total_time <= (length_beats + start_beats) * ticks_per_beat:
+                                if msg.type == 'note_on':
+                                    note_is_on[msg.note] = True
+                                elif msg.type == 'note_off':
+                                    note_is_on[msg.note] = False
+                                if time_first_msg < 0:
+                                    raise RuntimeWarning(f'Region {region_idx} in playlist {playlist_idx} overlapps with previous region.')
+                                elif num_events_inserted == 0:
+                                    msg_to_insert = msg.copy(time = time_first_msg)
+                                    total_time = time_first_msg + previous_region_end_time
+                                else:
+                                    msg_to_insert = msg.copy(time = msg.time)
+                                    total_time += msg.time
+                                if source_midi_total_time < (length_beats + start_beats) * ticks_per_beat or msg.type != 'note_on':
+                                    messages[route_id].append(msg_to_insert)
+                                    num_events_inserted += 1
+                                else:
+                                    verbose_print(f'\t\tIgnored midi event at {msg.time}', verbose=verbose)
                             else:
-                                msg_to_insert = msg.copy(time = msg.time)
-                                total_time += msg.time
-                            if source_midi_total_time < (length_beats + start_beats) * ticks_per_beat or msg.type != 'note_on':
-                                messages[route_id].append(msg_to_insert)
-                                num_events_inserted += 1
-                            else:
-                                verbose_print(f'\t\tIgnored midi event at {msg.time}', verbose=verbose)
-                        else:
-                            # Turn off all nodes that are still playing after the region ended
-                            for note in range(128):
-                                if note_is_on[note]:
-                                    messages[route_id].append(mido.Message('note_off', note=note))
-                                    note_is_on[note] = False
-                                    verbose_print(f'\t\tNote {note} was playing at end of region. Insert note_off event.', verbose=verbose)
-
-                verbose_print(f'\t\tInserted {num_events_inserted} midi events.', verbose=verbose)
-                previous_region_end_time = total_time
-
-
+                                # Turn off all nodes that are still playing after the region ended
+                                for note in range(128):
+                                    if note_is_on[note]:
+                                        messages[route_id].append(mido.Message('note_off', note=note))
+                                        note_is_on[note] = False
+                                        verbose_print(f'\t\tNote {note} was playing at end of region. Insert note_off event.', verbose=verbose)
+                        
+                    verbose_print(f'\t\tInserted {num_events_inserted} midi events.', verbose=verbose)
+                    previous_region_end_time = total_time
+                else:
+                    raise RuntimeError(f'\tRegion midi not found. Could not parse as it might get wrong timings.')
 
 def export(input_file : str, output_file : str, create_meta_track : bool = True, ticks_per_beat : int = 19200, verbose : bool = False,
             control_change_resolution: int = 4, pitch_bend_resolution: int = 256):
@@ -324,6 +349,7 @@ def export(input_file : str, output_file : str, create_meta_track : bool = True,
 
     midi_sources, automation_interpolation_styles = get_sources(ardour_dom, midi_dir, verbose=verbose)
     assemble(ardour_dom, output_midi, midi_sources, messages, verbose=verbose, ticks_per_beat=args.ticks_per_beat)
+    messages = sanitize_messages(messages)
     for route_id, msgs in messages.items():
         track = output_midi.add_track()
         track_add_messages(track, msgs, automation_interpolation_styles=automation_interpolation_styles[route_id], verbose=verbose,
